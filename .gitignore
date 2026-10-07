@@ -1,0 +1,17 @@
+# Secrets and local state
+.env
+.env.local
+.callid-store.json
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+contracts/out/
+contracts/cache/
+contracts/contract-metadata/
+
+# Editor / OS
+.DS_Store
+*.swp
