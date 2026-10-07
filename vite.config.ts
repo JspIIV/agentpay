@@ -4,6 +4,8 @@ import path from 'path'
 import { nodePolyfills } from 'vite-plugin-node-polyfills'
 
 export default defineConfig({
+  // Served from https://jspiv.github.io/agentpay/ in production; '/' in dev.
+  base: process.env.GITHUB_PAGES ? '/agentpay/' : '/',
   plugins: [react(), nodePolyfills()],
   resolve: {
     alias: {
