@@ -75,15 +75,21 @@ Start backend: `bun run server` (port 3001, proxied via Vite at `/api`)
 
 ```
 GET /api/service/:agentAddress
-  No X-Payment  → 402 { payment: { payTo, amount, callId, chainId, usdcAddress } }
-  X-Payment: <txHash> + ?callId=<callId>&payer=<address>  → 200 service response
+  No X-Payment  → 402 { payment: { payTo, amount, callId, nonce, signMessage, ... } }
+  X-Payment: <txHash> + X-Payment-Signature: <sig> + ?callId=<callId>
+                → 200 service response
   Replay → 409
 ```
 
-Verification matches the `PaymentMade` event signature, the payer, the payee and
-the callId, and requires the amount to cover `pricePerCall`. Redeemed callIds are
-written to `CALLID_STORE_PATH` (default `.callid-store.json`) so a restart cannot
-un-redeem a payment.
+The payer is recovered from `X-Payment-Signature`, not taken from the request.
+The server rebuilds the challenge string from its own stored nonce and compares
+the recovered signer against `topics[1]` of the `PaymentMade` log. Verification
+also matches the event signature, the payee and the callId, and requires the
+amount to cover `pricePerCall`.
+
+Challenges live in memory with a 10-minute TTL and are consumed on success.
+Redeemed callIds are written to `CALLID_STORE_PATH` (default `.callid-store.json`)
+so a restart cannot un-redeem a payment.
 
 ## To Run
 

@@ -94,14 +94,30 @@ protocol differences a generic EVM simulator does not:
 arc-forge test --network arc
 ```
 
-## Known limits
+## Proving who paid
 
-The 402 flow identifies the payer by an address passed back on the retry. Every
-value involved — transaction hash, `callId`, payer — is public in the
-`PaymentMade` log, so an observer watching the chain can race the real payer to
-redeem the response. Closing this properly needs a signed challenge: the server
-issues a nonce, the payer signs it, and the server recovers the address and
-checks it against the log. The contract is unaffected either way.
+Every value in a `PaymentMade` log is public: the transaction hash, the `callId`,
+the payer's address. If the endpoint took a claimed payer at face value, anyone
+watching the chain could replay those values and take the paid response before
+the real payer retried.
+
+So the payer is never asserted, only proved. The 402 carries a single-use nonce
+alongside the `callId`, and a `signMessage` string built from the chain id,
+contract, agent, call and nonce. The caller signs that string with the paying
+wallet and sends it back as `X-Payment-Signature`. The server rebuilds the same
+string from its own stored challenge — never from anything the caller sends — and
+recovers the signer from the signature. That recovered address is what gets
+matched against `topics[1]` of the log. An observer replaying the public values
+signs with their own key, recovers to their own address, and is rejected.
+
+Challenges expire after ten minutes and are consumed on success. They are held in
+memory on purpose: a challenge is worthless once its payment is served, and a
+restart costs the caller one extra round trip. The record of *redeemed* callIds is
+what persists, to `CALLID_STORE_PATH`.
+
+One caveat worth stating: the signature authenticates the payer to the server, but
+it travels over the transport. Serve the endpoint over HTTPS, or an eavesdropper
+can capture and replay it within the challenge window.
 
 ## License
 

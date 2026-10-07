@@ -13,9 +13,9 @@
  *     contractAddress: '0xDEF...',
  *   })
  *
- * Handles the full 402 → approve → pay(maxAmount) → retry cycle automatically.
- * Passes maxAmount to pay() for slippage protection.
- * Includes payer address in the retry request (required by server issue #7 fix).
+ * Handles the full 402 → approve → pay(maxAmount) → sign → retry cycle.
+ * Passes maxAmount to pay() for slippage protection, and proves ownership of the
+ * paying address by signing the server's single-use challenge.
  */
 
 import type { WalletClient, PublicClient, Address, Hex } from 'viem'
@@ -70,7 +70,8 @@ export interface ServiceResponse {
  *   2. Parse payment challenge: payTo, amount, callId
  *   3. Approve USDC allowance for the contract
  *   4. Call AgentPay.pay(payTo, callId, amount) — amount is the quoted price (maxAmount guard)
- *   5. Retry with X-Payment, ?callId, and ?payer headers
+ *   5. Sign the server's challenge string with the paying wallet
+ *   6. Retry with X-Payment, X-Payment-Signature and ?callId
  */
 export async function callAgentService(opts: CallAgentOptions): Promise<ServiceResponse> {
   const {
@@ -104,13 +105,15 @@ export async function callAgentService(opts: CallAgentOptions): Promise<ServiceR
       payTo: Address
       amount: string
       callId: Hex
+      nonce: Hex
+      signMessage: string
       chainId: number
       usdcAddress: Address
       contractAddress: Address
     }
   }
 
-  const { amount, callId, payTo } = body.payment
+  const { amount, callId, payTo, signMessage } = body.payment
   // Snapshot the quoted price — passed as maxAmount to prevent price manipulation
   const amountBn = BigInt(amount)
 
@@ -144,10 +147,17 @@ export async function callAgentService(opts: CallAgentOptions): Promise<ServiceR
   if (receipt.status !== 'success') throw new Error(`pay() reverted: ${payTx}`)
   console.log(`[AgentPay] Paid. tx: ${payTx}`)
 
-  // Step 5: retry with payment proof + payer address
-  const retryParams = new URLSearchParams({ ...queryParams, callId, payer: account })
+  // Step 5: prove we are the payer. The server rebuilds this exact string from
+  // its own stored challenge and recovers the signer, so the payer address is
+  // never taken on trust.
+  const signature = await walletClient.signMessage({ account, message: signMessage })
+
+  // Step 6: retry with the payment proof and the signature
+  const retryParams = new URLSearchParams({ ...queryParams, callId })
   const retryUrl = `${endpoint}?${retryParams}`
-  const retryResp = await fetch(retryUrl, { headers: { 'X-Payment': payTx } })
+  const retryResp = await fetch(retryUrl, {
+    headers: { 'X-Payment': payTx, 'X-Payment-Signature': signature },
+  })
 
   if (!retryResp.ok) {
     const errBody = await retryResp.text()

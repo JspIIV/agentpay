@@ -2,21 +2,33 @@
  * AgentPay x402 service endpoint.
  *
  * GET /service/:agentAddress
- *   - No X-Payment header  → 402 with payment instructions (includes a payer challenge)
- *   - X-Payment: <txHash>  → verify PaymentMade on-chain, return service result
- *     Required query params on retry: ?callId=<hex>&payer=<address>
+ *   - No X-Payment header  → 402 with a signing challenge (callId + server nonce)
+ *   - X-Payment: <txHash> + X-Payment-Signature: <sig>
+ *       → recover the payer from the signature, verify the matching PaymentMade
+ *         log on-chain, return the service result
+ *     Required query param on retry: ?callId=<hex>
  *
  * GET /health
  *
- * Security fixes (issue 7-9):
- *   7. verifyPayment checks topics[0] (event sig) + topics[1] (payer) + topics[2] (to) + topics[3] (callId)
- *   8. usedCallIds persisted to a local JSON file so restarts don't un-redeem payments
- *   9. cache key is `payer:agent:callId` matching the contract's per-payer dedup
+ * The payer is not self-asserted. Every value in a PaymentMade log — the
+ * transaction hash, the callId, the payer address — is public, so accepting a
+ * claimed payer would let anyone watching the chain race the real payer and
+ * take the paid response. Instead the 402 carries a single-use server nonce,
+ * the payer signs it, and the payer address is recovered from that signature
+ * and matched against topics[1] of the log.
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { createPublicClient, http, keccak256, toBytes, type Address, type Hex } from 'viem'
+import {
+  createPublicClient,
+  http,
+  keccak256,
+  recoverMessageAddress,
+  toBytes,
+  type Address,
+  type Hex,
+} from 'viem'
 import { defineChain } from 'viem'
 
 // ---- Chain / RPC config -------------------------------------------------------
@@ -113,11 +125,61 @@ function cacheKey(payer: string, agent: string, callId: string): string {
   return `${payer.toLowerCase()}:${agent.toLowerCase()}:${callId.toLowerCase()}`
 }
 
+// ---- Signing challenges -------------------------------------------------------
+// Issued with each 402 and consumed once. Kept in memory on purpose: a challenge
+// is worthless after its payment is served, and a restart only costs the caller
+// one extra 402 round trip. The *used* store above is what must survive.
+
+const CHALLENGE_TTL_MS = 10 * 60 * 1000
+
+interface Challenge {
+  nonce: Hex
+  agent: Address
+  expiresAt: number
+}
+
+const challenges = new Map<string, Challenge>()
+
+function randomHex32(): Hex {
+  return ('0x' + Array.from(
+    crypto.getRandomValues(new Uint8Array(32)),
+    (b) => b.toString(16).padStart(2, '0'),
+  ).join('')) as Hex
+}
+
+/**
+ * The exact text a payer signs. Built only from server-held values, never from
+ * anything the caller sends, so a signature cannot be steered at another
+ * contract, agent or chain.
+ */
+function challengeMessage(agent: Address, callId: Hex, nonce: Hex): string {
+  return [
+    'AgentPay payment claim',
+    `Chain: ${CHAIN_ID}`,
+    `Contract: ${CONTRACT_ADDRESS}`,
+    `Agent: ${agent}`,
+    `Call: ${callId}`,
+    `Nonce: ${nonce}`,
+  ].join('\n')
+}
+
+function issueChallenge(agent: Address): { callId: Hex; nonce: Hex; message: string } {
+  const now = Date.now()
+  for (const [k, c] of challenges) {
+    if (c.expiresAt <= now) challenges.delete(k)
+  }
+
+  const callId = randomHex32()
+  const nonce = randomHex32()
+  challenges.set(callId.toLowerCase(), { nonce, agent, expiresAt: now + CHALLENGE_TTL_MS })
+  return { callId, nonce, message: challengeMessage(agent, callId, nonce) }
+}
+
 // ---- Helpers ------------------------------------------------------------------
 
 function cors(res: ServerResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Headers', 'X-Payment, Content-Type')
+  res.setHeader('Access-Control-Allow-Headers', 'X-Payment, X-Payment-Signature, Content-Type')
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
 }
 
@@ -208,10 +270,7 @@ async function handleServiceRequest(
 
   // No payment header → issue 402 challenge
   if (!paymentHeader.trim()) {
-    const callId = ('0x' + Array.from(
-      crypto.getRandomValues(new Uint8Array(32)),
-      (b) => b.toString(16).padStart(2, '0'),
-    ).join('')) as Hex
+    const { callId, nonce, message } = issueChallenge(agentAddress)
 
     return json(res, 402, {
       error: 'Payment required',
@@ -220,6 +279,9 @@ async function handleServiceRequest(
         amount: agent.pricePerCall.toString(),
         amountUsdc: `${(Number(agent.pricePerCall) / 1_000_000).toFixed(6)} USDC`,
         callId,
+        nonce,
+        // Sign this exact string to prove you are the payer. Expires in 10 minutes.
+        signMessage: message,
         chainId: CHAIN_ID,
         usdcAddress: USDC_ADDRESS,
         contractAddress: CONTRACT_ADDRESS || null,
@@ -227,22 +289,48 @@ async function handleServiceRequest(
         instructions: [
           `1. USDC.approve("${CONTRACT_ADDRESS || '<contractAddress>'}", ${agent.pricePerCall})`,
           `2. AgentPay.pay("${agentAddress}", "${callId}", ${agent.pricePerCall})`,
-          `3. Retry GET with X-Payment: <txHash>  and ?callId=${callId}&payer=<yourAddress>`,
+          '3. Sign the `signMessage` string with the paying wallet',
+          `4. Retry GET with X-Payment: <txHash>, X-Payment-Signature: <signature>, and ?callId=${callId}`,
         ],
       },
     })
   }
 
-  // Has payment header → verify
+  // Has payment header → recover the payer, then verify the payment
   const txHash = paymentHeader.trim() as Hex
   const callId = url.searchParams.get('callId') as Hex | null
-  const payer = url.searchParams.get('payer') as Address | null
+  const signature = ((req.headers['x-payment-signature'] ?? '') as string).trim() as Hex
 
   if (!callId) {
     return json(res, 400, { error: 'Missing ?callId — pass the callId from the 402 response.' })
   }
-  if (!payer || !/^0x[0-9a-fA-F]{40}$/.test(payer)) {
-    return json(res, 400, { error: 'Missing or invalid ?payer — pass your wallet address.' })
+  if (!signature) {
+    return json(res, 400, {
+      error: 'Missing X-Payment-Signature — sign the `signMessage` string from the 402 response.',
+    })
+  }
+
+  const challenge = challenges.get(callId.toLowerCase())
+  if (!challenge || challenge.expiresAt <= Date.now()) {
+    challenges.delete(callId.toLowerCase())
+    return json(res, 400, {
+      error: 'Unknown or expired callId — request a fresh 402 challenge.',
+      callId,
+    })
+  }
+  if (challenge.agent.toLowerCase() !== agentAddress.toLowerCase()) {
+    return json(res, 400, { error: 'callId was issued for a different agent.' })
+  }
+
+  // Rebuild the message from stored values; never trust a caller-supplied one.
+  let payer: Address
+  try {
+    payer = await recoverMessageAddress({
+      message: challengeMessage(challenge.agent, callId, challenge.nonce),
+      signature,
+    })
+  } catch {
+    return json(res, 400, { error: 'Malformed X-Payment-Signature.' })
   }
 
   const key = cacheKey(payer, agentAddress, callId)
@@ -253,12 +341,15 @@ async function handleServiceRequest(
   const verified = await verifyPayment(txHash, payer, agentAddress, callId, agent.pricePerCall)
   if (!verified) {
     return json(res, 402, {
-      error: 'Payment not verified. Ensure the tx is confirmed, callId and payer match the 402 challenge.',
+      error:
+        'Payment not verified. The signer of X-Payment-Signature must be the address that sent this payment.',
       txHash,
       callId,
-      payer,
+      recoveredSigner: payer,
     })
   }
+
+  challenges.delete(callId.toLowerCase())
 
   markUsed(key)
 
@@ -297,6 +388,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       contract: CONTRACT_ADDRESS || 'not configured — set VITE_AGENTPAY_ADDRESS',
       rpc: rpcUrl.includes('_rpc_token') ? 'proxy' : 'public',
       storedCallIds: usedCallIds.size,
+      openChallenges: challenges.size,
     })
   }
 
