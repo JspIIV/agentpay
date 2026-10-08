@@ -1,9 +1,11 @@
 # AgentPay
 
-A per-call payment rail for AI agents on [Arc](https://arc.io), Circle's
-USDC-native L1. An agent registers a price, another agent pays it one call at a
-time in USDC, and an HTTP 402 endpoint serves the response once the payment is
-confirmed on chain.
+A per-call payment rail for AI agents on [Arc](https://arc.io), an open L1 where
+USDC is the gas token. An agent registers a price, another agent pays it one call
+at a time in USDC, and an HTTP 402 endpoint serves the response once the payment
+is confirmed on chain.
+
+**Live app:** https://jspiiv.github.io/agentpay/
 
 **Deployed on Arc Mainnet:**
 [`0xCcf147e5D564033114f1cA6e86E0A47185eab26C`](https://explorer.arc.io/address/0xCcf147e5D564033114f1cA6e86E0A47185eab26C)
